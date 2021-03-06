@@ -1,0 +1,218 @@
+import groovy.io.FileType
+import java.util.UUID
+
+/**
+ * Enumerates all folders from a given path. It returns a dictionary of 
+ * the found folder and its fully qualified path.
+ * 
+ * It ignores any folder that starts with .$, .#, or empty-.
+ * 
+ * @param Path is a fully qualified path to a folder
+ */
+@NonCPS
+def getFolders(path) {
+    println "Inside getFolders"
+    def marker = '.!'
+    def ignoreMarker = '.#'
+    def emptydirMarker = 'empty-'
+    def folders = [:]
+    def dir = new File(path)
+    println "Found the following folders:"
+    dir.eachFile (FileType.DIRECTORIES) {
+        if ((!it.name.startsWith(marker)) && (!it.name.startsWith(ignoreMarker)) && (!it.name.startsWith(emptydirMarker))) {
+            folders[it.name] = it.toString()
+            println "\t" + it.name
+        }
+    }
+    return folders
+}
+
+/**
+ * Tags folders in _todelete folder by prefixing folder
+ * with '.$' string. This will prevent other jobs picking
+ * up these folders for deletion.
+ * @param folders Folders found in _todelete folder 
+ */
+def markFoldersForDeletion(folders, max) {
+    println "Inside markFoldersForDeletion"
+    def marker = ".!"
+    int count=0  
+    def foldersToDelete = [:]
+    for (folder in folders) {
+        count++
+        def newName = marker + folder.key
+        def oldFolderPath = folder.value
+        def todeleteFolderPath = getParentPath(oldFolderPath) // Get _toDelete path
+        def newFolderPath = todeleteFolderPath.toString() + "\\" + newName
+        foldersToDelete[folder.key] = newFolderPath // The original folder name will be use as the key
+        File oldFolder = new File(oldFolderPath)
+        File newFolder = new File(newFolderPath)
+        oldFolder.renameTo(newFolder) // Tag folders to delete
+        println ("Marked " + oldFolderPath + " for deletion." )
+        if (count == max) {
+            break;
+        }
+    }
+    return foldersToDelete
+}
+
+/**
+ * Returns the path to the parent of a given path
+ * 
+ * @param A fully qualified path
+ */
+@NonCPS
+def getParentPath(path)
+{
+    File file = new File(path)
+    def parentPath = file.getParentFile()
+    return parentPath.toString()
+}
+
+/**
+ * Creates an empty folder using a unique string. This
+ * avoids clashing with other jobs that also uses
+ * an empty folder.
+ * 
+ * @noparam
+ */
+@NonCPS
+def createEmptyDir(folder) {
+    println "Inside createEmptyDir"
+    def todeleteFolderPath = getParentPath(folder) // Get _toDelete path
+    def emptyDir = todeleteFolderPath + "\\empty-" + UUID.randomUUID().toString() // Empty folder is required by Robocopy
+    println "Creating empty folder at " + emptyDir
+    try {
+        File emptyDirFile = new File(emptyDir)
+        emptyDirFile.mkdirs()
+        if (emptyDirFile.exists()) {
+            println "Create empty folder ok"
+        } else {
+            println "Create empty folder failed"
+        }
+    } catch (Exception ex) {
+        println "Failed to create an empty folder at " + emptyDir
+    }
+    
+    return emptyDir
+}
+
+/**
+ * Executes a given command in the shell. The output is
+ * 
+ * @param command A string containing the command to execute
+ */
+@NonCPS
+def shellCommand(command)
+{
+    println("Run shell command " + command)
+    def sout = new StringBuffer(), serr = new StringBuffer()
+    def proc = command.execute()
+    proc.consumeProcessOutput(sout, serr)
+    proc.waitForProcessOutput()
+    println "out> $sout err> $serr"
+}
+
+/**
+ * Deletes a given folder using Robocopy by mirroring the target
+ * folder to an empty folder. Robocopy creates a log file
+ * using the original project folder name.
+ * 
+ * The RoboCopy log file is created in the parent folder of the
+ * folder to be deleted (e.g. _todelete path). It returns a string
+ * containing the filename of the logfile.
+ * 
+ * @param folder A dictionary with a value containing the folder to delete
+ */
+@NonCPS
+def deleteFolder(folder)
+{
+    println "Inside deleteFolder"
+    def foldertoDelete = folder.value
+    def projectName = folder.key
+    def emptyDir = createEmptyDir(foldertoDelete)
+    println "Check if " + emptyDir + " exists before proceding with delete."
+    File emptyDirFile = new File(emptyDir)
+    def logFileName
+    if (emptyDirFile.exists()) { // Make sure the empty folder is created before we start deleting
+        def todeleteFolderPath = getParentPath(foldertoDelete) // Get _toDelete path
+        logFileName = "${projectName}_log.txt"
+        def logFile = todeleteFolderPath + "\\" + logFileName
+        println "Deleting ${foldertoDelete}"
+        def roboCommand = "robocopy \"${emptyDir}\" \"${foldertoDelete}\" /mir /MT:8 /tee /LOG+:\"${logFile}\""
+        println "Executing " + roboCommand
+        shellCommand(roboCommand)
+        println "Deleting ${foldertoDelete}" 
+        try {
+            File file = new File(foldertoDelete) // At this point the folder is empty and we can delete it
+            file.delete()
+        } catch (Exception ex) {
+            println "Failed to delete " + foldertoDelete
+        }
+        // Clean up
+        println "Deleting ${emptyDir}"
+        emptyDirFile.delete()
+    }
+    else
+    {
+        println 'Empty folder was not created. Skipping delete.'
+    }
+    
+    return logFileName
+}
+
+/**
+ * Loops through a list of folders and calls deleteFolder
+ * on each one.
+ * 
+ * @param foldersToDelete A list of dictionary of folders to delete
+ */
+@NonCPS
+def deleteFolders(foldersToDelete)
+{
+    println "Inside deleteFolders"
+    for (folder in foldersToDelete) {
+        deleteFolder(folder)
+    }
+}
+
+node ('util-worker') {
+	try {
+	    timestamps {
+	        stage ('Delete') {
+	            def todeleteFolder= "\\\\servername\\share\\parentfolder\\_todelete" // Define folder where to enumerate
+	            folders = getFolders(todeleteFolder)
+	            if (folders.size() > 0) {
+	                println "Found " + folders.size().toString() + " folders in ${todeleteFolder}."
+	                def numFoldersToDelete = 5 // max number of folders to select
+	                def foldersToDelete = markFoldersForDeletion(folders, numFoldersToDelete) // Use a map to track folders to delete
+	                foldersToDelete.eachWithIndex { folder, index ->
+	                    println "Deleting ${folder.value}"
+	                    def logFilename = deleteFolder(folder)    // Delete folder and get the path to the name of log file
+	                    dir(todeleteFolder) {  // Change folder to _todelete folder and copy log file into workspace and delete from _todelete folder
+	                        def PWD = pwd()
+	                        println "Copying log file ${PWD}\\${logFilename} to ${WORKSPACE}"
+	                        fileOperations([fileCopyOperation(excludes: '', flattenFiles: false, includes: "${logFilename}", targetLocation: "${WORKSPACE}")])
+	                        fileOperations([fileDeleteOperation(excludes: '', includes: "${logFilename}")])
+	                    } // dir
+	                    sleep 10 // Need sleep here otherwise log files arent copied Jenkins bug?
+	                } // foldersToDelete.eachWithIndex
+	                println "Archiving log.txt"
+	                archiveArtifacts allowEmptyArchive: true, artifacts: '*_log.txt'
+	           } else {
+	               println "Nothing to do"
+	           } // if (folders.Size()
+	           // Clean workspace
+	           cleanWs notFailBuild: true
+	       } // stage
+	   } // timestamps
+	} // try
+	catch (err) {
+	    def jobname = currentBuild.displayName
+	    currentBuild.result = "FAILURE"
+		//emailBody = ""
+		//emailSubject = ""
+		//emailext body: emailBody, subject: emailSubject, to: emailrcpt
+	    throw err
+	}
+}
